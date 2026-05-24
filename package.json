@@ -1,0 +1,16 @@
+{
+  "name": "pi-ds-thinking-compact",
+  "version": "0.1.0",
+  "description": "Pi extension to compress DeepSeek/Anthropic thinking blocks in context to prevent topic inertia",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "check": "tsc --noEmit",
+    "smoke": "node --import tsx -e \"import ext from './src/index.ts'; if (typeof ext !== 'function') throw new Error('not a function'); console.log('pi-ds-thinking-compact')\""
+  },
+  "keywords": ["pi", "extension", "thinking", "context", "compress"],
+  "license": "MIT",
+  "devDependencies": {
+    "typescript": "^5.8.0"
+  }
+}
