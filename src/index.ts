@@ -1,38 +1,159 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+// pi-ds-thinking-compact
+//
+// Before each LLM call, scan past assistant messages for thinking blocks.
+// Use a cheap model to summarize each one into a short text block,
+// replacing the verbose reasoning the model would otherwise re-read.
+//
+// Model for summarization (cheapest thinking-capable model):
+//   defaults to "deepseek/deepseek-v4-flash"
+//   override with PI_COMPACT_THINKING_MODEL env var
+//
+// Config:
+//   PI_COMPACT_THINKING_MODEL - model to use for summarization
+//   PI_COMPACT_THINKING_MIN_CHARS - skip blocks shorter than this (default 200)
+//
+import type { ExtensionAPI, ExtensionContext, ContextEvent, ContextEventResult } from "@earendil-works/pi-coding-agent";
+import { completeSimple } from "@earendil-works/pi-ai";
+import type { Model, Api } from "@earendil-works/pi-ai";
 
-const MAX_CHARS = 120;
+// ---- config ---------------------------------------------------------------
 
-const compress = (text: string): string => {
-  if (text.length <= MAX_CHARS) return text;
-  return `${text.slice(0, MAX_CHARS).trim()}…`;
-};
+const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+const MIN_CHARS = Number(process.env.PI_COMPACT_THINKING_MIN_CHARS) || 200;
 
-export default function (pi: ExtensionAPI) {
-  pi.on("context", (event) => {
-    let changed = false;
+const SUMMARY_PROMPT =
+  "Summarize the following internal reasoning in 1-2 sentences. " +
+  "Output only the summary, no preamble, no explanation.\n\n" +
+  "--- REASONING ---\n";
 
-    const messages = event.messages.map((msg) => {
-      if (msg.role !== "assistant") return msg;
+function getModelId(): string {
+  return process.env.PI_COMPACT_THINKING_MODEL || DEFAULT_MODEL;
+}
 
-      const newContent = msg.content.map((block) => {
-        if (block.type !== "thinking") return block;
-        if ((block as any).redacted) return block;
+// ---- helpers --------------------------------------------------------------
 
-        const original = (block as any).thinking as string;
-        const compressed = compress(original);
-        if (compressed === original) return block;
+function parseModelId(id: string): { provider: string; modelId: string } {
+  const sep = id.indexOf("/");
+  if (sep === -1) throw new Error(`Invalid model id: ${id}`);
+  return { provider: id.slice(0, sep), modelId: id.slice(sep + 1) };
+}
 
-        changed = true;
-        return {
-          type: "text" as const,
-          text: `[Previous reasoning: ${compressed}]`,
-        };
-      });
+async function summarize(
+  thinkingText: string,
+  model: Model<Api>,
+  apiKey: string,
+): Promise<string | undefined> {
+  try {
+    const result = await completeSimple(
+      model,
+      {
+        messages: [
+          { role: "user", content: [{ type: "text", text: SUMMARY_PROMPT + thinkingText }] },
+        ],
+      },
+      {
+        apiKey,
+        maxTokens: 200,
+        temperature: 0,
+      },
+    );
 
-      if (newContent === msg.content) return msg;
-      return { ...msg, content: newContent };
+    // Extract text from result
+    const texts = result.content
+      .filter((b: { type: string }) => b.type === "text")
+      .map((b: { text: string }) => b.text);
+    return texts.join("").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+// ---- core handler ---------------------------------------------------------
+
+async function contextHandler(
+  event: ContextEvent,
+  ctx: ExtensionContext,
+): Promise<ContextEventResult | void> {
+  const modelId = getModelId();
+  const { provider, modelId: modelName } = parseModelId(modelId);
+  const compactModel = ctx.modelRegistry.find(provider, modelName);
+
+  if (!compactModel) {
+    // Summarization model not available; skip silently
+    return;
+  }
+
+  const apiKey = await ctx.modelRegistry.getApiKeyForProvider(provider);
+  if (!apiKey) return;
+
+  // Collect thinking blocks that need summarization
+  interface PendingBlock {
+    msgIndex: number;
+    blockIndex: number;
+    text: string;
+  }
+  const pending: PendingBlock[] = [];
+  let changed = false;
+
+  const messages = event.messages.map((msg, msgIndex) => {
+    if (msg.role !== "assistant") return msg;
+
+    const newContent = msg.content.map((block, blockIndex) => {
+      if (block.type !== "thinking") return block;
+
+      const thinkingBlock = block as unknown as { type: "thinking"; thinking: string };
+      if (thinkingBlock.thinking.length < MIN_CHARS) return block;
+
+      pending.push({ msgIndex, blockIndex, text: thinkingBlock.thinking });
+      changed = true;
+      // Placeholder — will be replaced after summarization
+      return {
+        type: "text" as const,
+        text: `[thinking: summarizing...]`,
+      };
     });
 
-    return changed ? { messages } : {};
+    if (newContent === msg.content) return msg;
+    return { ...msg, content: newContent };
   });
+
+  if (!changed) return;
+
+  // Summarize all pending blocks in parallel
+  const replacements = new Map<string, string>();
+  key: `${msgIndex}-${blockIndex}`;
+
+  await Promise.all(
+    pending.map(async (b) => {
+      const summary = await summarize(b.text, compactModel, apiKey);
+      replacements.set(`${b.msgIndex}-${b.blockIndex}`, summary || `[Previous reasoning: ${b.text.slice(0, MIN_CHARS)}…]`);
+    }),
+  );
+
+  // Apply summaries to replaced messages
+  const finalized = messages.map((msg, msgIndex) => {
+    if (msg.role !== "assistant") return msg;
+
+    const newContent = msg.content.map((block, blockIndex) => {
+      const key = `${msgIndex}-${blockIndex}`;
+      const replacement = replacements.get(key);
+      if (!replacement) return block;
+
+      return {
+        type: "text" as const,
+        text: `[Previous reasoning: ${replacement}]`,
+      };
+    });
+
+    if (newContent === msg.content) return msg;
+    return { ...msg, content: newContent };
+  });
+
+  return { messages: finalized };
+}
+
+// ---- export ---------------------------------------------------------------
+
+export default function (pi: ExtensionAPI) {
+  pi.on("context", contextHandler);
 }
