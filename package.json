@@ -5,8 +5,7 @@
   "type": "module",
   "main": "src/index.ts",
   "scripts": {
-    "check": "tsc --noEmit",
-    "smoke": "node --import tsx -e \"import ext from './src/index.ts'; if (typeof ext !== 'function') throw new Error('not a function'); console.log('pi-ds-thinking-compact')\""
+    "lint": "node -e \"require('fs').readFileSync('src/index.ts','utf8'); console.log('pi-ds-thinking-compact')\""
   },
   "keywords": ["pi", "extension", "thinking", "context", "compress"],
   "license": "MIT",

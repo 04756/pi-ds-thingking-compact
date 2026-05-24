@@ -12,7 +12,7 @@
 //   PI_COMPACT_THINKING_MODEL - model to use for summarization
 //   PI_COMPACT_THINKING_MIN_CHARS - skip blocks shorter than this (default 200)
 //
-import type { ExtensionAPI, ExtensionContext, ContextEvent, ContextEventResult } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, ContextEvent } from "@earendil-works/pi-coding-agent";
 import { completeSimple } from "@earendil-works/pi-ai";
 import type { Model, Api } from "@earendil-works/pi-ai";
 
@@ -38,11 +38,19 @@ function parseModelId(id: string): { provider: string; modelId: string } {
   return { provider: id.slice(0, sep), modelId: id.slice(sep + 1) };
 }
 
+// ---- summarization cache ---------------------------------------------------
+// Avoid re-summarizing the same thinking text every turn.
+const summaryCache = new Map<string, string>();
+
 async function summarize(
   thinkingText: string,
   model: Model<Api>,
   apiKey: string,
 ): Promise<string | undefined> {
+  // Return cached summary if we've seen this text before
+  const cached = summaryCache.get(thinkingText);
+  if (cached !== undefined) return cached;
+
   try {
     const result = await completeSimple(
       model,
@@ -62,7 +70,9 @@ async function summarize(
     const texts = result.content
       .filter((b: { type: string }) => b.type === "text")
       .map((b: { text: string }) => b.text);
-    return texts.join("").trim() || undefined;
+    const summary = texts.join("").trim() || undefined;
+    if (summary) summaryCache.set(thinkingText, summary);
+    return summary;
   } catch {
     return undefined;
   }
@@ -73,7 +83,7 @@ async function summarize(
 async function contextHandler(
   event: ContextEvent,
   ctx: ExtensionContext,
-): Promise<ContextEventResult | void> {
+): Promise<{ messages: typeof event.messages } | void> {
   const modelId = getModelId();
   const { provider, modelId: modelName } = parseModelId(modelId);
   const compactModel = ctx.modelRegistry.find(provider, modelName);
@@ -95,10 +105,10 @@ async function contextHandler(
   const pending: PendingBlock[] = [];
   let changed = false;
 
-  const messages = event.messages.map((msg, msgIndex) => {
+  const messages = event.messages.map((msg, msgIndex: number) => {
     if (msg.role !== "assistant") return msg;
 
-    const newContent = msg.content.map((block, blockIndex) => {
+    const newContent = msg.content.map((block: any, blockIndex: number) => {
       if (block.type !== "thinking") return block;
 
       const thinkingBlock = block as unknown as { type: "thinking"; thinking: string };
@@ -121,20 +131,19 @@ async function contextHandler(
 
   // Summarize all pending blocks in parallel
   const replacements = new Map<string, string>();
-  key: `${msgIndex}-${blockIndex}`;
 
   await Promise.all(
     pending.map(async (b) => {
       const summary = await summarize(b.text, compactModel, apiKey);
-      replacements.set(`${b.msgIndex}-${b.blockIndex}`, summary || `[Previous reasoning: ${b.text.slice(0, MIN_CHARS)}…]`);
+      replacements.set(`${b.msgIndex}-${b.blockIndex}`, summary || `reasoning truncated to ${MIN_CHARS} chars: ${b.text.slice(0, MIN_CHARS)}…`);
     }),
   );
 
   // Apply summaries to replaced messages
-  const finalized = messages.map((msg, msgIndex) => {
+  const finalized = messages.map((msg: any, msgIndex: number) => {
     if (msg.role !== "assistant") return msg;
 
-    const newContent = msg.content.map((block, blockIndex) => {
+    const newContent = msg.content.map((block: any, blockIndex: number) => {
       const key = `${msgIndex}-${blockIndex}`;
       const replacement = replacements.get(key);
       if (!replacement) return block;
